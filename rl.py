@@ -5,11 +5,12 @@ import numpy as np
 import torch
 from data import D3Dataset, SidDataset, RLTitle2SidDataset, RLSeqTitle2SidDataset, RLSid2TitleDataset, RLSidhis2TitleDataset
 from torch.utils.data import ConcatDataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 import os
 from minionerec_trainer import ReReTrainer
 from sasrec import SASRec
 from fire import Fire
+from peft import LoraConfig, TaskType
 import pickle
 import math
 import json
@@ -26,6 +27,12 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def parse_lora_target_modules(lora_target_modules: str):
+    if not lora_target_modules or lora_target_modules == "all":
+        return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    return [module.strip() for module in lora_target_modules.split(",") if module.strip()]
 
 def train(
     # model/data params
@@ -66,11 +73,20 @@ def train(
     item_meta_path: str = "",
     dapo: bool = False,
     gspo: bool = False,
+    use_lora: bool = False,
+    use_qlora: bool = False,
+    lora_r: int = 64,
+    lora_alpha: int = 128,
+    lora_dropout: float = 0.05,
+    lora_target_modules: str = "all",
 ):
     torch.backends.cuda.enable_flash_sdp(False)  
     torch.backends.cuda.enable_mem_efficient_sdp(False)
     set_seed(seed)
-    
+
+    if use_qlora:
+        use_lora = True
+
     category_dict = {"Industrial_and_Scientific": "industrial and scientific items", "Office_Products": "office products", "Toys_and_Games": "toys and games", "Sports": "sports and outdoors", "Books": "books"}
     print(category)
     
@@ -133,7 +149,19 @@ def train(
     print("train_dataset: ", train_dataset)
     print("eval_dataset: ", eval_dataset)
 
-    llm_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, device_map="auto")
+    llm_model_kwargs = {"torch_dtype": torch.bfloat16, "device_map": "auto"}
+    model_init_kwargs = {"torch_dtype": "bfloat16"}
+    if use_qlora:
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+        llm_model_kwargs["quantization_config"] = quantization_config
+        model_init_kwargs["quantization_config"] = quantization_config
+
+    llm_model = AutoModelForCausalLM.from_pretrained(model_path, **llm_model_kwargs)
     device = llm_model.device
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     
@@ -260,6 +288,18 @@ def train(
     os.environ['WANDB_PROJECT'] = wandb_project
     os.environ["WANDB_MODE"] = "offline"
 
+    peft_config = None
+    if use_lora:
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            target_modules=parse_lora_target_modules(lora_target_modules),
+            bias="none",
+            modules_to_save=["embed_tokens", "lm_head"],
+        )
+
     training_args = GRPOConfig(output_dir=output_dir,
                                 save_steps=0.1,
                                 save_total_limit=20,
@@ -284,6 +324,7 @@ def train(
                                 save_strategy="steps",
                                 report_to="wandb",
                                 run_name=wandb_run_name,
+                                model_init_kwargs=model_init_kwargs,
                             )
     trainer = ReReTrainer(
         model=model_path,
@@ -302,6 +343,7 @@ def train(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         args=training_args,
+        peft_config=peft_config,
     )
 
     trainer.train()

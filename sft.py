@@ -6,7 +6,7 @@ import fire
 import torch
 import transformers
 from datasets import load_dataset, concatenate_datasets
-from transformers import EarlyStoppingCallback, AutoConfig
+from transformers import EarlyStoppingCallback, AutoConfig, BitsAndBytesConfig
 from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 from dataclasses import dataclass
 import torch.nn as nn
@@ -19,12 +19,12 @@ import transformers
 from torch.optim.lr_scheduler import LambdaLR
 import json
 import torch.nn as nn
-import bitsandbytes as bnb
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from data import D3Dataset, SFTData, SidSFTDataset, SidItemFeatDataset, FusionSeqRecDataset, PreferenceSFTDataset, UserPreference2sidSFTDataset, TitleHistory2SidSFTDataset
 import random
 from datasets import Dataset as HFDataset
 from torch.utils.data import ConcatDataset
+from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 
 
 class TokenExtender:
@@ -86,6 +86,11 @@ def get_cosine_schedule_with_warmup(
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
+def parse_lora_target_modules(lora_target_modules: str):
+    if not lora_target_modules or lora_target_modules == "all":
+        return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    return [module.strip() for module in lora_target_modules.split(",") if module.strip()]
+
 
 def train(
     # model/data params
@@ -113,6 +118,12 @@ def train(
     train_from_scratch: bool = False,
     sid_index_path: str = "",
     item_meta_path: str = "",
+    use_lora: bool = False,
+    use_qlora: bool = False,
+    lora_r: int = 64,
+    lora_alpha: int = 128,
+    lora_dropout: float = 0.05,
+    lora_target_modules: str = "all",
 ):
     set_seed(seed)
     os.environ['WANDB_PROJECT'] = wandb_project
@@ -131,10 +142,25 @@ def train(
         device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
         gradient_accumulation_steps = gradient_accumulation_steps // world_size
 
+    if use_qlora:
+        use_lora = True
+        if train_from_scratch:
+            raise ValueError("QLoRA does not support train_from_scratch=True. Please load from a pretrained base model.")
+
     if not train_from_scratch:
+        model_init_kwargs = {"torch_dtype": torch.bfloat16}
+        if use_qlora:
+            model_init_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+            model_init_kwargs["device_map"] = device_map
+
         model = AutoModelForCausalLM.from_pretrained(
             base_model,
-            torch_dtype=torch.bfloat16,
+            **model_init_kwargs,
         )
     else:
         config = AutoConfig.from_pretrained(base_model)
@@ -145,6 +171,9 @@ def train(
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
+
+    new_tokens = []
+    original_vocab_size = model.get_input_embeddings().weight.shape[0]
     
     if sid_index_path and os.path.exists(sid_index_path):
         print(f"Loading index from {sid_index_path}")
@@ -157,6 +186,26 @@ def train(
             print(f"Adding {len(new_tokens)} new tokens to tokenizer")
             tokenizer.add_tokens(new_tokens)
             model.resize_token_embeddings(len(tokenizer))
+
+    if use_lora:
+        if freeze_LLM:
+            print("Warning: use_lora=True overrides freeze_LLM. LoRA already keeps base weights frozen.")
+            freeze_LLM = False
+
+        if use_qlora:
+            model = prepare_model_for_kbit_training(model)
+
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            target_modules=parse_lora_target_modules(lora_target_modules),
+            bias="none",
+            modules_to_save=["embed_tokens", "lm_head"],
+        )
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
 
     # Freeze LLM parameters if required
     if freeze_LLM:
@@ -239,7 +288,7 @@ def train(
             learning_rate=learning_rate,
             bf16=True,
             logging_steps=1,
-            optim="adamw_torch",
+            optim="paged_adamw_32bit" if use_qlora else "adamw_torch",
             eval_strategy="steps",
             eval_steps=eval_step, 
             save_strategy="steps",
@@ -249,6 +298,7 @@ def train(
             load_best_model_at_end=True,
             ddp_find_unused_parameters=False if ddp else None,
             group_by_length=group_by_length,
+            gradient_checkpointing=use_lora,
             report_to=None,
         ),
         data_collator=transformers.DataCollatorForSeq2Seq(

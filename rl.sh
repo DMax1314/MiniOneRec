@@ -34,6 +34,12 @@ for category in "Industrial_and_Scientific"; do
                         --add_gt False \
                         --beta 1e-3 \
                         --dapo False \
+                        --use_lora False \
+                        --use_qlora False \
+                        --lora_r 64 \
+                        --lora_alpha 128 \
+                        --lora_dropout 0.05 \
+                        --lora_target_modules all \
                         --output_dir output_dir \
                         --wandb_run_name wandb_name \
                         --sid_index_path ./data/Amazon/index/Industrial_and_Scientific.index.json \

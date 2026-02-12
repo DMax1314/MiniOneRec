@@ -22,5 +22,11 @@ for category in "Industrial_and_Scientific"; do
             --seed 42 \
             --sid_index_path ./data/Amazon/index/Industrial_and_Scientific.index.json \
             --item_meta_path ./data/Amazon/index//Industrial_and_Scientific.item.json \
+            --use_lora False \
+            --use_qlora False \
+            --lora_r 64 \
+            --lora_alpha 128 \
+            --lora_dropout 0.05 \
+            --lora_target_modules all \
             --freeze_LLM False
 done
